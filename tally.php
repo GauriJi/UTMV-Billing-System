@@ -303,12 +303,7 @@ $recent_purchases= $db->fetchAll("SELECT p.purchase_no, p.purchase_date, p.grand
     <?php include 'sidebar.php'; ?>
 
     <main class="main-content">
-        <header class="top-bar">
-            <h2 class="page-title">🔗 Tally Link</h2>
-            <div class="user-info">
-                <span class="date-time"><?php echo date('l, F j, Y'); ?></span>
-            </div>
-        </header>
+        <?php $page_title = '🔗 Tally Link'; include 'topbar.php'; ?>
 
         <div class="content-wrapper">
 

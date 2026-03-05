@@ -1,5 +1,5 @@
 <?php
-require_once 'auth.php'; // Authentication check
+require_once 'auth.php';
 require_once 'database.php';
 $db = new Database();
 
@@ -8,11 +8,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     try {
         $db->beginTransaction();
         
-        // Get company settings for invoice number
         $settings = $db->single("SELECT * FROM company_settings LIMIT 1");
         $prefix = $settings['invoice_prefix'] ?? 'INV';
         
-        // Generate invoice number
         $last_invoice = $db->single("SELECT invoice_no FROM sales ORDER BY id DESC LIMIT 1");
         if ($last_invoice) {
             $last_num = intval(substr($last_invoice['invoice_no'], strlen($prefix)));
@@ -21,13 +19,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             $invoice_no = $prefix . '00001';
         }
         
-        // Insert sale
-        $sale_sql = "INSERT INTO sales (invoice_no, customer_id, sale_date, total_amount, cgst_amount, sgst_amount, igst_amount, grand_total, payment_status, notes) 
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        // Resolve customer — saved ID or manual typed name
+        $cust_id     = !empty($_POST['customer_id']) ? (int)$_POST['customer_id'] : null;
+        $cust_manual = (!$cust_id && !empty($_POST['customer_name_manual']))
+                       ? trim($_POST['customer_name_manual']) : null;
+
+        $sale_sql = "INSERT INTO sales (invoice_no, customer_id, customer_name_manual, sale_date, total_amount, cgst_amount, sgst_amount, igst_amount, grand_total, payment_status, notes) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         
         $db->query($sale_sql, [
             $invoice_no,
-            $_POST['customer_id'] ?: null,
+            $cust_id,
+            $cust_manual,
             $_POST['sale_date'],
             $_POST['total_amount'],
             $_POST['cgst_total'],
@@ -40,12 +43,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         
         $sale_id = $db->lastInsertId();
         
-        // Insert sale items
         $items = json_decode($_POST['items'], true);
         foreach ($items as $item) {
             $item_sql = "INSERT INTO sales_items (sale_id, product_id, product_name, hsn_code, quantity, rate, amount, gst_rate, cgst, sgst, igst, total)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-            
             $db->query($item_sql, [
                 $sale_id,
                 $item['product_id'] ?: null,
@@ -60,8 +61,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                 $item['igst'],
                 $item['total']
             ]);
-            
-            // Update stock
             if ($item['product_id']) {
                 $db->query("UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?", 
                           [$item['quantity'], $item['product_id']]);
@@ -69,7 +68,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         }
         
         $db->commit();
-        
         header("Location: invoice_print.php?id=" . $sale_id);
         exit;
         
@@ -79,10 +77,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     }
 }
 
-// Get customers and products
 $customers = $db->fetchAll("SELECT * FROM customers ORDER BY customer_name");
-$products = $db->fetchAll("SELECT * FROM products ORDER BY product_name");
-$company = $db->single("SELECT * FROM company_settings LIMIT 1");
+$products  = $db->fetchAll("SELECT * FROM products ORDER BY product_name");
+$company   = $db->single("SELECT * FROM company_settings LIMIT 1");
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -92,632 +89,488 @@ $company = $db->single("SELECT * FROM company_settings LIMIT 1");
     <title>Sales Invoice - <?php echo APP_NAME; ?></title>
     <link rel="stylesheet" href="style.css">
     <style>
-        /* Autocomplete Styles */
-        .product-search-container {
-            position: relative;
-            width: 100%;
-        }
+        .product-search-container { position: relative; width: 100%; }
 
         .product-search-input {
-            width: 100%;
-            padding: 8px 12px;
-            border: 2px solid #e2e8f0;
-            border-radius: 6px;
-            font-size: 14px;
-            transition: all 0.3s ease;
+            width: 100%; padding: 8px 12px;
+            border: 2px solid #e2e8f0; border-radius: 6px;
+            font-size: 14px; transition: all 0.3s ease;
         }
-
         .product-search-input:focus {
-            outline: none;
-            border-color: #2563eb;
-            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+            outline: none; border-color: #2563eb;
+            box-shadow: 0 0 0 3px rgba(37,99,235,0.1);
         }
 
         .product-suggestions {
-            position: absolute;
-            top: 100%;
-            left: 0;
-            right: 0;
-            background: white;
-            border: 1px solid #e2e8f0;
-            border-radius: 6px;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-            max-height: 300px;
-            overflow-y: auto;
-            z-index: 1000;
-            margin-top: 4px;
-            display: none;
+            position: absolute; top: 100%; left: 0; right: 0;
+            background: white; border: 1px solid #e2e8f0; border-radius: 6px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15); max-height: 300px;
+            overflow-y: auto; z-index: 1000; margin-top: 4px; display: none;
         }
-
-        .product-suggestions.active {
-            display: block;
-        }
+        .product-suggestions.active { display: block; }
 
         .product-suggestion-item {
-            padding: 12px 16px;
-            cursor: pointer;
-            border-bottom: 1px solid #f1f5f9;
-            transition: background 0.2s ease;
+            padding: 12px 16px; cursor: pointer;
+            border-bottom: 1px solid #f1f5f9; transition: background 0.2s ease;
         }
+        .product-suggestion-item:hover { background: #f8fafc; }
+        .product-suggestion-item:last-child { border-bottom: none; }
+        .product-name { font-weight: 600; color: #1e293b; margin-bottom: 4px; }
+        .product-details { font-size: 12px; color: #64748b; }
+        .product-details span { margin-right: 12px; }
+        .no-results { padding: 16px; text-align: center; color: #94a3b8; font-size: 14px; }
 
-        .product-suggestion-item:hover {
-            background: #f8fafc;
-        }
+        .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
 
-        .product-suggestion-item:last-child {
-            border-bottom: none;
-        }
-
-        .product-name {
-            font-weight: 600;
-            color: #1e293b;
-            margin-bottom: 4px;
-        }
-
-        .product-details {
-            font-size: 12px;
-            color: #64748b;
-        }
-
-        .product-details span {
-            margin-right: 12px;
-        }
-
-        .no-results {
-            padding: 16px;
-            text-align: center;
-            color: #94a3b8;
-            font-size: 14px;
-        }
-
-        .search-icon {
-            position: absolute;
-            right: 12px;
-            top: 50%;
-            transform: translateY(-50%);
-            color: #94a3b8;
-            pointer-events: none;
-        }
-
-        .selected-product-badge {
-            display: inline-flex;
-            align-items: center;
-            padding: 4px 10px;
-            background: #e0f2fe;
-            color: #0369a1;
-            border-radius: 4px;
-            font-size: 12px;
-            font-weight: 500;
-            margin-top: 4px;
-        }
-
-        .clear-selection {
-            margin-left: 8px;
-            cursor: pointer;
-            color: #0284c7;
-            font-weight: bold;
-        }
-
-        .section-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 20px;
-        }
-
-        .global-search-container {
-            position: relative;
-        }
-
+        .global-search-container { position: relative; }
         .global-search-container .product-search-input {
-            width: 100%;
-            padding: 10px 16px;
-            font-size: 15px;
-            border: 2px solid #e2e8f0;
-            border-radius: 8px;
+            width: 100%; padding: 10px 16px; font-size: 15px;
+            border: 2px solid #e2e8f0; border-radius: 8px;
         }
-
         .global-search-container .product-search-input:focus {
-            border-color: #2563eb;
-            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+            border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,0.1);
         }
+        #globalSuggestions { min-width: 400px; }
 
-        #globalSuggestions {
-            min-width: 400px;
+        /* Customer search dropdown */
+        #cust_drop {
+            position: absolute; top: 100%; left: 0; right: 0;
+            background: white; border: 1px solid #e2e8f0; border-radius: 8px;
+            box-shadow: 0 6px 16px rgba(0,0,0,0.12); max-height: 220px;
+            overflow-y: auto; z-index: 999; margin-top: 3px; display: none;
+        }
+        .cust-item {
+            padding: 10px 14px; cursor: pointer; font-size: 13px;
+            border-bottom: 1px solid #f1f5f9; transition: background 0.15s;
+        }
+        .cust-item:hover { background: #f8fafc; }
+        .cust-item:last-child { border-bottom: none; }
+        .cust-manual { color: #64748b; }
+        .cust-badge {
+            display: none; margin-top: 5px; padding: 4px 12px;
+            background: #eff6ff; border-radius: 6px; font-size: 12px;
+            color: #1d4ed8; font-weight: 600;
         }
     </style>
 </head>
 <body>
-    <div class="app-container">
-        <?php include 'sidebar.php'; ?>
+<div class="app-container">
+    <?php include 'sidebar.php'; ?>
 
-        <main class="main-content">
-            <header class="top-bar">
-                <h2 class="page-title">Create Sales Invoice</h2>
-                <a href="index.php" class="btn btn-secondary">← Back to Dashboard</a>
-            </header>
+    <main class="main-content">
+        <?php $page_title = 'Create Sales Invoice'; include 'topbar.php'; ?>
 
-            <div class="content-wrapper">
-                <?php if(isset($error)): ?>
-                    <div class="alert alert-error"><?php echo $error; ?></div>
-                <?php endif; ?>
+        <div class="content-wrapper">
+            <?php if(isset($error)): ?>
+                <div class="alert alert-error"><?php echo $error; ?></div>
+            <?php endif; ?>
 
-                <form id="salesForm" method="POST" class="invoice-form">
-                    <input type="hidden" name="action" value="save_sale">
-                    
-                    <div class="form-grid">
-                        <div class="form-group">
-                            <label for="customer_id">Customer *</label>
-                            <select name="customer_id" id="customer_id" class="form-control">
-                                <option value="">Walk-in Customer</option>
-                                <?php foreach($customers as $customer): ?>
-                                    <option value="<?php echo $customer['id']; ?>" 
-                                            data-gstin="<?php echo $customer['gstin']; ?>"
-                                            data-state="<?php echo $customer['state']; ?>">
-                                        <?php echo htmlspecialchars($customer['customer_name']); ?>
-                                    </option>
-                                <?php endforeach; ?>
-                            </select>
-                        </div>
+            <form id="salesForm" method="POST" class="invoice-form">
+                <input type="hidden" name="action" value="save_sale">
+                
+                <div class="form-grid">
 
-                        <div class="form-group">
-                            <label for="sale_date">Invoice Date *</label>
-                            <input type="date" name="sale_date" id="sale_date" class="form-control" value="<?php echo date('Y-m-d'); ?>" required>
-                        </div>
-
-                        <div class="form-group">
-                            <label for="payment_status">Payment Status *</label>
-                            <select name="payment_status" id="payment_status" class="form-control" required>
-                                <option value="pending">Pending</option>
-                                <option value="partial">Partial</option>
-                                <option value="paid">Paid</option>
-                            </select>
-                        </div>
-                    </div>
-
-                    <!-- Items Section -->
-                    <div class="items-section">
-                        <div class="section-header">
-                            <h3>Invoice Items</h3>
-                            <div style="display: flex; gap: 12px; align-items: center;">
-                                <div class="global-search-container" style="position: relative; width: 350px;">
-                                    <input type="text" 
-                                           id="globalProductSearch" 
-                                           class="product-search-input" 
-                                           placeholder="🔍 Search products to add..." 
-                                           autocomplete="off"
-                                           oninput="globalSearchProduct(this.value)"
-                                           onfocus="showGlobalSuggestions()">
-                                    <div class="product-suggestions" id="globalSuggestions"></div>
-                                </div>
-                                <button type="button" class="btn btn-primary" onclick="addItem()">+ Add Manually</button>
-                            </div>
-                        </div>
-
-                        <div class="table-container">
-                            <table class="items-table" id="itemsTable">
-                                <thead>
-                                    <tr>
-                                        <th style="width: 30%">Product</th>
-                                        <th style="width: 12%">HSN Code</th>
-                                        <th style="width: 10%">Qty</th>
-                                        <th style="width: 12%">Rate</th>
-                                        <th style="width: 8%">GST %</th>
-                                        <th style="width: 12%">Amount</th>
-                                        <th style="width: 12%">Total</th>
-                                        <th style="width: 4%">Action</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="itemsBody">
-                                    <!-- Items will be added dynamically -->
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-
-                    <!-- Totals Section -->
-                    <div class="totals-section">
-                        <div class="form-group full-width">
-                            <label for="notes">Notes</label>
-                            <textarea name="notes" id="notes" class="form-control" rows="2" placeholder="Additional notes..."></textarea>
-                        </div>
-
-                        <div class="totals-grid">
-                            <div class="total-item">
-                                <span>Subtotal:</span>
-                                <strong id="subtotal_display">₹0.00</strong>
-                            </div>
-                            <div class="total-item">
-                                <span>CGST:</span>
-                                <strong id="cgst_display">₹0.00</strong>
-                            </div>
-                            <div class="total-item">
-                                <span>SGST:</span>
-                                <strong id="sgst_display">₹0.00</strong>
-                            </div>
-                            <div class="total-item">
-                                <span>IGST:</span>
-                                <strong id="igst_display">₹0.00</strong>
-                            </div>
-                            <div class="total-item grand-total">
-                                <span>Grand Total:</span>
-                                <strong id="grand_total_display">₹0.00</strong>
-                            </div>
-                        </div>
-                    </div>
-
-                    <input type="hidden" name="total_amount" id="total_amount">
-                    <input type="hidden" name="cgst_total" id="cgst_total">
-                    <input type="hidden" name="sgst_total" id="sgst_total">
-                    <input type="hidden" name="igst_total" id="igst_total">
-                    <input type="hidden" name="grand_total" id="grand_total">
-                    <input type="hidden" name="items" id="items_json">
-
-                    <div class="form-actions">
-                        <button type="submit" class="btn btn-success btn-lg">💾 Save & Print Invoice</button>
-                        <button type="button" class="btn btn-secondary btn-lg" onclick="window.location.href='index.php'">Cancel</button>
-                    </div>
-                </form>
-            </div>
-        </main>
-    </div>
-
-    <script>
-        const products = <?php echo json_encode($products); ?>;
-        const companyState = "<?php echo $company['state'] ?? 'Maharashtra'; ?>";
-        let itemCounter = 0;
-        let items = [];
-
-        // Global product search functionality
-        function globalSearchProduct(query) {
-            const suggestionsDiv = document.getElementById('globalSuggestions');
-            
-            if (!query || query.length < 1) {
-                suggestionsDiv.classList.remove('active');
-                return;
-            }
-            
-            const filteredProducts = products.filter(p => {
-                const searchTerm = query.toLowerCase();
-                return p.product_name.toLowerCase().includes(searchTerm) || 
-                       (p.hsn_code && p.hsn_code.toLowerCase().includes(searchTerm)) ||
-                       (p.sku && p.sku.toLowerCase().includes(searchTerm));
-            });
-            
-            if (filteredProducts.length === 0) {
-                suggestionsDiv.innerHTML = '<div class="no-results">No products found</div>';
-                suggestionsDiv.classList.add('active');
-                return;
-            }
-            
-            let html = '';
-            filteredProducts.slice(0, 10).forEach(product => {
-                html += `
-                    <div class="product-suggestion-item" onclick="addProductFromGlobalSearch(${product.id})">
-                        <div class="product-name">${product.product_name}</div>
-                        <div class="product-details">
-                            <span>HSN: ${product.hsn_code || 'N/A'}</span>
-                            <span>Rate: ₹${parseFloat(product.rate).toFixed(2)}</span>
-                            <span>GST: ${product.gst_rate}%</span>
-                            <span>Stock: ${product.stock_quantity || 0}</span>
-                        </div>
-                    </div>
-                `;
-            });
-            
-            suggestionsDiv.innerHTML = html;
-            suggestionsDiv.classList.add('active');
-        }
-
-        function showGlobalSuggestions() {
-            const input = document.getElementById('globalProductSearch');
-            if (input.value.length >= 1) {
-                globalSearchProduct(input.value);
-            }
-        }
-
-        function addProductFromGlobalSearch(productId) {
-            const product = products.find(p => p.id == productId);
-            
-            if (product) {
-                // Add new item row
-                itemCounter++;
-                const row = document.createElement('tr');
-                row.id = 'item_' + itemCounter;
-                row.innerHTML = `
-                    <td>
-                        <div class="product-search-container" id="search_container_${itemCounter}">
-                            <input type="text" 
-                                   class="product-search-input" 
-                                   id="search_${itemCounter}"
-                                   value="${product.product_name}"
-                                   placeholder="🔍 Search product by name or HSN..."
+                    <!-- ── Customer field with search + manual entry ── -->
+                    <div class="form-group">
+                        <label>Customer</label>
+                        <div style="position:relative;">
+                            <input type="text" id="customer_search" class="form-control"
+                                   placeholder="🔍 Search or type any name manually..."
                                    autocomplete="off"
-                                   oninput="searchProduct(${itemCounter}, this.value)"
-                                   onfocus="showSuggestions(${itemCounter})">
-                            <div class="product-suggestions" id="suggestions_${itemCounter}"></div>
-                            <input type="hidden" id="product_id_${itemCounter}" value="${product.id}">
+                                   oninput="searchCustomer(this.value)"
+                                   onblur="setTimeout(()=>{document.getElementById('cust_drop').style.display='none'},200)">
+                            <div id="cust_drop"></div>
                         </div>
-                    </td>
-                    <td><input type="text" class="form-control hsn-input" id="hsn_${itemCounter}" value="${product.hsn_code}" placeholder="HSN"></td>
-                    <td><input type="number" class="form-control qty-input" id="qty_${itemCounter}" value="1" min="1" onchange="calculateRow(${itemCounter})"></td>
-                    <td><input type="number" class="form-control rate-input" id="rate_${itemCounter}" value="${product.rate}" step="0.01" onchange="calculateRow(${itemCounter})"></td>
-                    <td><input type="number" class="form-control gst-input" id="gst_${itemCounter}" value="${product.gst_rate}" step="0.01" onchange="calculateRow(${itemCounter})"></td>
-                    <td><strong id="amount_${itemCounter}">₹0.00</strong></td>
-                    <td><strong id="total_${itemCounter}">₹0.00</strong></td>
-                    <td><button type="button" class="btn-remove" onclick="removeItem(${itemCounter})">✕</button></td>
-                `;
-                document.getElementById('itemsBody').appendChild(row);
-                
-                items.push({
-                    id: itemCounter,
-                    product_id: product.id,
-                    product_name: product.product_name,
-                    hsn_code: product.hsn_code,
-                    quantity: 1,
-                    rate: parseFloat(product.rate),
-                    amount: 0,
-                    gst_rate: parseFloat(product.gst_rate),
-                    cgst: 0,
-                    sgst: 0,
-                    igst: 0,
-                    total: 0
-                });
-
-                // Calculate the row
-                calculateRow(itemCounter);
-
-                // Clear and hide suggestions
-                document.getElementById('globalProductSearch').value = '';
-                document.getElementById('globalSuggestions').classList.remove('active');
-
-                // Focus on quantity field
-                document.getElementById('qty_' + itemCounter).focus();
-                document.getElementById('qty_' + itemCounter).select();
-            }
-        }
-
-        function addItem() {
-            itemCounter++;
-            const row = document.createElement('tr');
-            row.id = 'item_' + itemCounter;
-            row.innerHTML = `
-                <td>
-                    <div class="product-search-container" id="search_container_${itemCounter}">
-                        <input type="text" 
-                               class="product-search-input" 
-                               id="search_${itemCounter}"
-                               placeholder="🔍 Search product by name or HSN..."
-                               autocomplete="off"
-                               oninput="searchProduct(${itemCounter}, this.value)"
-                               onfocus="showSuggestions(${itemCounter})">
-                        <div class="product-suggestions" id="suggestions_${itemCounter}"></div>
-                        <input type="hidden" id="product_id_${itemCounter}">
+                        <!-- hidden fields sent to server -->
+                        <input type="hidden" name="customer_id"          id="customer_id">
+                        <input type="hidden" name="customer_name_manual" id="customer_name_manual">
+                        <div id="cust_badge" class="cust-badge"></div>
                     </div>
-                </td>
-                <td><input type="text" class="form-control hsn-input" id="hsn_${itemCounter}" placeholder="HSN"></td>
-                <td><input type="number" class="form-control qty-input" id="qty_${itemCounter}" value="1" min="1" onchange="calculateRow(${itemCounter})"></td>
-                <td><input type="number" class="form-control rate-input" id="rate_${itemCounter}" value="0" step="0.01" onchange="calculateRow(${itemCounter})"></td>
-                <td><input type="number" class="form-control gst-input" id="gst_${itemCounter}" value="18" step="0.01" onchange="calculateRow(${itemCounter})"></td>
-                <td><strong id="amount_${itemCounter}">₹0.00</strong></td>
-                <td><strong id="total_${itemCounter}">₹0.00</strong></td>
-                <td><button type="button" class="btn-remove" onclick="removeItem(${itemCounter})">✕</button></td>
-            `;
-            document.getElementById('itemsBody').appendChild(row);
-            
-            items.push({
-                id: itemCounter,
-                product_id: '',
-                product_name: '',
-                hsn_code: '',
-                quantity: 1,
-                rate: 0,
-                amount: 0,
-                gst_rate: 18,
-                cgst: 0,
-                sgst: 0,
-                igst: 0,
-                total: 0
-            });
 
-            // Focus on the new search input
-            document.getElementById('search_' + itemCounter).focus();
-        }
+                    <div class="form-group">
+                        <label for="sale_date">Invoice Date *</label>
+                        <input type="date" name="sale_date" id="sale_date" class="form-control"
+                               value="<?php echo date('Y-m-d'); ?>" required>
+                    </div>
 
-        function searchProduct(itemId, query) {
-            const suggestionsDiv = document.getElementById('suggestions_' + itemId);
-            
-            if (!query || query.length < 1) {
-                suggestionsDiv.classList.remove('active');
-                return;
-            }
-            
-            const filteredProducts = products.filter(p => {
-                const searchTerm = query.toLowerCase();
-                return p.product_name.toLowerCase().includes(searchTerm) || 
-                       (p.hsn_code && p.hsn_code.toLowerCase().includes(searchTerm)) ||
-                       (p.sku && p.sku.toLowerCase().includes(searchTerm));
-            });
-            
-            if (filteredProducts.length === 0) {
-                suggestionsDiv.innerHTML = '<div class="no-results">No products found</div>';
-                suggestionsDiv.classList.add('active');
-                return;
-            }
-            
-            let html = '';
-            filteredProducts.slice(0, 10).forEach(product => {
-                html += `
-                    <div class="product-suggestion-item" onclick="selectSearchedProduct(${itemId}, ${product.id})">
-                        <div class="product-name">${product.product_name}</div>
-                        <div class="product-details">
-                            <span>HSN: ${product.hsn_code || 'N/A'}</span>
-                            <span>Rate: ₹${parseFloat(product.rate).toFixed(2)}</span>
-                            <span>GST: ${product.gst_rate}%</span>
-                            <span>Stock: ${product.stock_quantity || 0}</span>
+                    <div class="form-group">
+                        <label for="payment_status">Payment Status *</label>
+                        <select name="payment_status" id="payment_status" class="form-control" required>
+                            <option value="pending">Pending</option>
+                            <option value="partial">Partial</option>
+                            <option value="paid">Paid</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- Items Section -->
+                <div class="items-section">
+                    <div class="section-header">
+                        <h3>Invoice Items</h3>
+                        <div style="display:flex;gap:12px;align-items:center;">
+                            <div class="global-search-container" style="position:relative;width:350px;">
+                                <input type="text" id="globalProductSearch"
+                                       class="product-search-input"
+                                       placeholder="🔍 Search products to add..."
+                                       autocomplete="off"
+                                       oninput="globalSearchProduct(this.value)"
+                                       onfocus="showGlobalSuggestions()">
+                                <div class="product-suggestions" id="globalSuggestions"></div>
+                            </div>
+                            <button type="button" class="btn btn-primary" onclick="addItem()">+ Add Manually</button>
                         </div>
                     </div>
-                `;
-            });
-            
-            suggestionsDiv.innerHTML = html;
-            suggestionsDiv.classList.add('active');
-        }
 
-        function showSuggestions(itemId) {
-            const input = document.getElementById('search_' + itemId);
-            if (input.value.length >= 1) {
-                searchProduct(itemId, input.value);
-            }
-        }
+                    <div class="table-container">
+                        <table class="items-table" id="itemsTable">
+                            <thead>
+                                <tr>
+                                    <th style="width:30%">Product</th>
+                                    <th style="width:12%">HSN Code</th>
+                                    <th style="width:10%">Qty</th>
+                                    <th style="width:12%">Rate</th>
+                                    <th style="width:8%">GST %</th>
+                                    <th style="width:12%">Amount</th>
+                                    <th style="width:12%">Total</th>
+                                    <th style="width:4%">Action</th>
+                                </tr>
+                            </thead>
+                            <tbody id="itemsBody"></tbody>
+                        </table>
+                    </div>
+                </div>
 
-        function selectSearchedProduct(itemId, productId) {
-            const product = products.find(p => p.id == productId);
-            const item = items.find(i => i.id === itemId);
-            
-            if (product && item) {
-                item.product_id = product.id;
-                item.product_name = product.product_name;
-                item.hsn_code = product.hsn_code;
-                item.rate = parseFloat(product.rate);
-                item.gst_rate = parseFloat(product.gst_rate);
-                
-                // Update UI
-                document.getElementById('search_' + itemId).value = product.product_name;
-                document.getElementById('product_id_' + itemId).value = product.id;
-                document.getElementById('hsn_' + itemId).value = product.hsn_code;
-                document.getElementById('rate_' + itemId).value = product.rate;
-                document.getElementById('gst_' + itemId).value = product.gst_rate;
-                
-                // Hide suggestions
-                document.getElementById('suggestions_' + itemId).classList.remove('active');
-                
-                // Calculate row
-                calculateRow(itemId);
-            }
-        }
+                <!-- Totals Section -->
+                <div class="totals-section">
+                    <div class="form-group full-width">
+                        <label for="notes">Notes</label>
+                        <textarea name="notes" id="notes" class="form-control" rows="2" placeholder="Additional notes..."></textarea>
+                    </div>
+                    <div class="totals-grid">
+                        <div class="total-item"><span>Subtotal:</span><strong id="subtotal_display">₹0.00</strong></div>
+                        <div class="total-item"><span>CGST:</span><strong id="cgst_display">₹0.00</strong></div>
+                        <div class="total-item"><span>SGST:</span><strong id="sgst_display">₹0.00</strong></div>
+                        <div class="total-item"><span>IGST:</span><strong id="igst_display">₹0.00</strong></div>
+                        <div class="total-item grand-total"><span>Grand Total:</span><strong id="grand_total_display">₹0.00</strong></div>
+                    </div>
+                </div>
 
-        function calculateRow(itemId) {
-            const item = items.find(i => i.id === itemId);
-            
-            item.product_name = document.getElementById('search_' + itemId).value || 'Manual Entry';
-            item.hsn_code = document.getElementById('hsn_' + itemId).value;
-            item.quantity = parseFloat(document.getElementById('qty_' + itemId).value) || 0;
-            item.rate = parseFloat(document.getElementById('rate_' + itemId).value) || 0;
-            item.gst_rate = parseFloat(document.getElementById('gst_' + itemId).value) || 0;
-            
-            item.amount = item.quantity * item.rate;
-            
-            // Check if inter-state or intra-state
-            const customerSelect = document.getElementById('customer_id');
-            const selectedCustomer = customerSelect.options[customerSelect.selectedIndex];
-            const customerState = selectedCustomer ? selectedCustomer.dataset.state : companyState;
-            const isInterState = customerState && customerState !== companyState;
-            
-            if (isInterState) {
-                // IGST for inter-state
-                item.igst = (item.amount * item.gst_rate) / 100;
-                item.cgst = 0;
-                item.sgst = 0;
-            } else {
-                // CGST + SGST for intra-state
-                item.cgst = (item.amount * item.gst_rate) / 200;
-                item.sgst = (item.amount * item.gst_rate) / 200;
-                item.igst = 0;
-            }
-            
-            item.total = item.amount + item.cgst + item.sgst + item.igst;
-            
-            document.getElementById('amount_' + itemId).textContent = '₹' + item.amount.toFixed(2);
-            document.getElementById('total_' + itemId).textContent = '₹' + item.total.toFixed(2);
-            
-            calculateTotals();
-        }
+                <input type="hidden" name="total_amount" id="total_amount">
+                <input type="hidden" name="cgst_total"   id="cgst_total">
+                <input type="hidden" name="sgst_total"   id="sgst_total">
+                <input type="hidden" name="igst_total"   id="igst_total">
+                <input type="hidden" name="grand_total"  id="grand_total">
+                <input type="hidden" name="items"        id="items_json">
 
-        function removeItem(itemId) {
-            document.getElementById('item_' + itemId).remove();
-            items = items.filter(i => i.id !== itemId);
-            calculateTotals();
-        }
+                <div class="form-actions">
+                    <button type="submit" class="btn btn-success btn-lg">💾 Save &amp; Print Invoice</button>
+                    <button type="button" class="btn btn-secondary btn-lg" onclick="window.location.href='index.php'">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </main>
+</div>
 
-        function calculateTotals() {
-            let subtotal = 0;
-            let cgst = 0;
-            let sgst = 0;
-            let igst = 0;
-            
-            items.forEach(item => {
-                subtotal += item.amount;
-                cgst += item.cgst;
-                sgst += item.sgst;
-                igst += item.igst;
-            });
-            
-            const grandTotal = subtotal + cgst + sgst + igst;
-            
-            document.getElementById('subtotal_display').textContent = '₹' + subtotal.toFixed(2);
-            document.getElementById('cgst_display').textContent = '₹' + cgst.toFixed(2);
-            document.getElementById('sgst_display').textContent = '₹' + sgst.toFixed(2);
-            document.getElementById('igst_display').textContent = '₹' + igst.toFixed(2);
-            document.getElementById('grand_total_display').textContent = '₹' + grandTotal.toFixed(2);
-            
-            document.getElementById('total_amount').value = subtotal.toFixed(2);
-            document.getElementById('cgst_total').value = cgst.toFixed(2);
-            document.getElementById('sgst_total').value = sgst.toFixed(2);
-            document.getElementById('igst_total').value = igst.toFixed(2);
-            document.getElementById('grand_total').value = grandTotal.toFixed(2);
-        }
+<script>
+const products     = <?php echo json_encode($products); ?>;
+const companyState = "<?php echo addslashes($company['state'] ?? 'Maharashtra'); ?>";
+let itemCounter = 0;
+let items = [];
 
-        document.getElementById('salesForm').onsubmit = function(e) {
-            if (items.length === 0) {
-                alert('Please add at least one item');
-                e.preventDefault();
-                return false;
-            }
-            document.getElementById('items_json').value = JSON.stringify(items);
+// ─── Customer search with manual entry ───────────────────────────────────────
+const customerList = <?php echo json_encode(array_map(function($c){
+    return ['id'=>$c['id'],'name'=>$c['customer_name'],'gstin'=>$c['gstin'],'state'=>$c['state']];
+}, $customers)); ?>;
+
+// Track selected customer state for GST calc
+let selectedCustomerState = '';
+
+function searchCustomer(val) {
+    const drop    = document.getElementById('cust_drop');
+    const hidId   = document.getElementById('customer_id');
+    const hidName = document.getElementById('customer_name_manual');
+    const badge   = document.getElementById('cust_badge');
+
+    // Reset selection — whatever is typed becomes the manual name fallback
+    hidId.value   = '';
+    hidName.value = val.trim();
+    selectedCustomerState = '';
+    badge.style.display   = 'none';
+
+    if (!val.trim()) { drop.style.display = 'none'; return; }
+
+    const matches = customerList.filter(c =>
+        c.name.toLowerCase().includes(val.toLowerCase())
+    );
+
+    drop.innerHTML = '';
+
+    // "Use as manual" option always first
+    const manualDiv = document.createElement('div');
+    manualDiv.className = 'cust-item cust-manual';
+    manualDiv.innerHTML = `✏️ Use <b>"${val}"</b> as manual customer name`;
+    manualDiv.onmousedown = () => {
+        hidId.value   = '';
+        hidName.value = val.trim();
+        selectedCustomerState = '';
+        document.getElementById('customer_search').value = val.trim();
+        badge.textContent    = '✏️ Manual: ' + val.trim();
+        badge.style.display  = 'block';
+        drop.style.display   = 'none';
+        items.forEach(i => calculateRow(i.id));
+    };
+    drop.appendChild(manualDiv);
+
+    matches.forEach(c => {
+        const d = document.createElement('div');
+        d.className = 'cust-item';
+        d.innerHTML = `👤 <strong>${c.name}</strong>${c.gstin ? ' <span style="color:#94a3b8;font-size:11px;"> | ' + c.gstin + '</span>' : ''}`;
+        d.onmousedown = () => {
+            hidId.value            = c.id;
+            hidName.value          = '';
+            selectedCustomerState  = c.state || '';
+            document.getElementById('customer_search').value = c.name;
+            badge.textContent    = '✅ ' + c.name;
+            badge.style.display  = 'block';
+            drop.style.display   = 'none';
+            items.forEach(i => calculateRow(i.id));
         };
+        drop.appendChild(d);
+    });
 
-        // Focus on global search on page load
-        document.getElementById('globalProductSearch').focus();
+    drop.style.display = 'block';
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
-        // Update GST on customer change
-        document.getElementById('customer_id').onchange = function() {
-            items.forEach(item => calculateRow(item.id));
-        };
+// ─── Product search (global bar) ─────────────────────────────────────────────
+function globalSearchProduct(query) {
+    const suggestionsDiv = document.getElementById('globalSuggestions');
+    if (!query || query.length < 1) { suggestionsDiv.classList.remove('active'); return; }
 
-        // Close suggestions when clicking outside
-        document.addEventListener('click', function(e) {
-            if (!e.target.closest('.product-search-container') && !e.target.closest('.global-search-container')) {
-                document.querySelectorAll('.product-suggestions').forEach(div => {
-                    div.classList.remove('active');
-                });
-            }
-        });
+    const filtered = products.filter(p => {
+        const s = query.toLowerCase();
+        return p.product_name.toLowerCase().includes(s) ||
+               (p.hsn_code && p.hsn_code.toLowerCase().includes(s));
+    });
 
-        // Handle keyboard navigation in search
-        document.addEventListener('keydown', function(e) {
-            const activeInput = document.activeElement;
-            
-            // Handle row search inputs
-            if (activeInput && activeInput.classList.contains('product-search-input') && activeInput.id !== 'globalProductSearch') {
-                const itemId = parseInt(activeInput.id.replace('search_', ''));
-                const suggestionsDiv = document.getElementById('suggestions_' + itemId);
-                
-                if (e.key === 'Escape') {
-                    suggestionsDiv.classList.remove('active');
-                }
-            }
-            
-            // Handle global search input
-            if (activeInput && activeInput.id === 'globalProductSearch') {
-                const suggestionsDiv = document.getElementById('globalSuggestions');
-                
-                if (e.key === 'Escape') {
-                    suggestionsDiv.classList.remove('active');
-                    activeInput.value = '';
-                }
-            }
-        });
-    </script>
+    if (filtered.length === 0) {
+        suggestionsDiv.innerHTML = '<div class="no-results">No products found</div>';
+        suggestionsDiv.classList.add('active');
+        return;
+    }
+
+    suggestionsDiv.innerHTML = filtered.slice(0,10).map(p => `
+        <div class="product-suggestion-item" onclick="addProductFromGlobalSearch(${p.id})">
+            <div class="product-name">${p.product_name}</div>
+            <div class="product-details">
+                <span>HSN: ${p.hsn_code||'N/A'}</span>
+                <span>Rate: ₹${parseFloat(p.rate).toFixed(2)}</span>
+                <span>GST: ${p.gst_rate}%</span>
+                <span>Stock: ${p.stock_quantity||0}</span>
+            </div>
+        </div>`).join('');
+    suggestionsDiv.classList.add('active');
+}
+
+function showGlobalSuggestions() {
+    const input = document.getElementById('globalProductSearch');
+    if (input.value.length >= 1) globalSearchProduct(input.value);
+}
+
+function addProductFromGlobalSearch(productId) {
+    const product = products.find(p => p.id == productId);
+    if (!product) return;
+
+    itemCounter++;
+    const row = document.createElement('tr');
+    row.id = 'item_' + itemCounter;
+    row.innerHTML = itemRowHTML(itemCounter, product.product_name, product.hsn_code, product.rate, product.gst_rate, product.id);
+    document.getElementById('itemsBody').appendChild(row);
+
+    items.push({ id:itemCounter, product_id:product.id, product_name:product.product_name,
+        hsn_code:product.hsn_code, quantity:1, rate:parseFloat(product.rate),
+        amount:0, gst_rate:parseFloat(product.gst_rate), cgst:0, sgst:0, igst:0, total:0 });
+
+    calculateRow(itemCounter);
+    document.getElementById('globalProductSearch').value = '';
+    document.getElementById('globalSuggestions').classList.remove('active');
+    document.getElementById('qty_' + itemCounter).focus();
+    document.getElementById('qty_' + itemCounter).select();
+}
+
+function itemRowHTML(id, name='', hsn='', rate=0, gst=18, pid='') {
+    return `
+        <td>
+            <div class="product-search-container" id="search_container_${id}">
+                <input type="text" class="product-search-input" id="search_${id}"
+                       value="${name}" placeholder="🔍 Search product..."
+                       autocomplete="off"
+                       oninput="searchProduct(${id}, this.value)"
+                       onfocus="showSuggestions(${id})">
+                <div class="product-suggestions" id="suggestions_${id}"></div>
+                <input type="hidden" id="product_id_${id}" value="${pid}">
+            </div>
+        </td>
+        <td><input type="text"   class="form-control hsn-input"  id="hsn_${id}"  value="${hsn}"  placeholder="HSN"></td>
+        <td><input type="number" class="form-control qty-input"  id="qty_${id}"  value="1" min="1" onchange="calculateRow(${id})"></td>
+        <td><input type="number" class="form-control rate-input" id="rate_${id}" value="${rate}" step="0.01" onchange="calculateRow(${id})"></td>
+        <td><input type="number" class="form-control gst-input"  id="gst_${id}"  value="${gst}"  step="0.01" onchange="calculateRow(${id})"></td>
+        <td><strong id="amount_${id}">₹0.00</strong></td>
+        <td><strong id="total_${id}">₹0.00</strong></td>
+        <td><button type="button" class="btn-remove" onclick="removeItem(${id})">✕</button></td>`;
+}
+
+function addItem() {
+    itemCounter++;
+    const row = document.createElement('tr');
+    row.id = 'item_' + itemCounter;
+    row.innerHTML = itemRowHTML(itemCounter);
+    document.getElementById('itemsBody').appendChild(row);
+    items.push({ id:itemCounter, product_id:'', product_name:'', hsn_code:'',
+        quantity:1, rate:0, amount:0, gst_rate:18, cgst:0, sgst:0, igst:0, total:0 });
+    document.getElementById('search_' + itemCounter).focus();
+}
+
+function searchProduct(itemId, query) {
+    const suggestionsDiv = document.getElementById('suggestions_' + itemId);
+    if (!query || query.length < 1) { suggestionsDiv.classList.remove('active'); return; }
+
+    const filtered = products.filter(p => {
+        const s = query.toLowerCase();
+        return p.product_name.toLowerCase().includes(s) ||
+               (p.hsn_code && p.hsn_code.toLowerCase().includes(s));
+    });
+
+    if (filtered.length === 0) {
+        suggestionsDiv.innerHTML = '<div class="no-results">No products found</div>';
+        suggestionsDiv.classList.add('active');
+        return;
+    }
+
+    suggestionsDiv.innerHTML = filtered.slice(0,10).map(p => `
+        <div class="product-suggestion-item" onclick="selectSearchedProduct(${itemId}, ${p.id})">
+            <div class="product-name">${p.product_name}</div>
+            <div class="product-details">
+                <span>HSN: ${p.hsn_code||'N/A'}</span>
+                <span>Rate: ₹${parseFloat(p.rate).toFixed(2)}</span>
+                <span>GST: ${p.gst_rate}%</span>
+                <span>Stock: ${p.stock_quantity||0}</span>
+            </div>
+        </div>`).join('');
+    suggestionsDiv.classList.add('active');
+}
+
+function showSuggestions(itemId) {
+    const input = document.getElementById('search_' + itemId);
+    if (input.value.length >= 1) searchProduct(itemId, input.value);
+}
+
+function selectSearchedProduct(itemId, productId) {
+    const product = products.find(p => p.id == productId);
+    const item    = items.find(i => i.id === itemId);
+    if (!product || !item) return;
+
+    item.product_id   = product.id;
+    item.product_name = product.product_name;
+    item.hsn_code     = product.hsn_code;
+    item.rate         = parseFloat(product.rate);
+    item.gst_rate     = parseFloat(product.gst_rate);
+
+    document.getElementById('search_'     + itemId).value = product.product_name;
+    document.getElementById('product_id_' + itemId).value = product.id;
+    document.getElementById('hsn_'        + itemId).value = product.hsn_code;
+    document.getElementById('rate_'       + itemId).value = product.rate;
+    document.getElementById('gst_'        + itemId).value = product.gst_rate;
+    document.getElementById('suggestions_'+ itemId).classList.remove('active');
+
+    calculateRow(itemId);
+}
+
+function calculateRow(itemId) {
+    const item = items.find(i => i.id === itemId);
+    if (!item) return;
+
+    item.product_name = document.getElementById('search_' + itemId).value || 'Manual Entry';
+    item.hsn_code     = document.getElementById('hsn_'    + itemId).value;
+    item.quantity     = parseFloat(document.getElementById('qty_'  + itemId).value) || 0;
+    item.rate         = parseFloat(document.getElementById('rate_' + itemId).value) || 0;
+    item.gst_rate     = parseFloat(document.getElementById('gst_'  + itemId).value) || 0;
+    item.amount       = item.quantity * item.rate;
+
+    // Use selectedCustomerState (from search) for GST type
+    const isInterState = selectedCustomerState && selectedCustomerState !== companyState;
+
+    if (isInterState) {
+        item.igst = (item.amount * item.gst_rate) / 100;
+        item.cgst = 0; item.sgst = 0;
+    } else {
+        item.cgst = (item.amount * item.gst_rate) / 200;
+        item.sgst = (item.amount * item.gst_rate) / 200;
+        item.igst = 0;
+    }
+
+    item.total = item.amount + item.cgst + item.sgst + item.igst;
+
+    document.getElementById('amount_' + itemId).textContent = '₹' + item.amount.toFixed(2);
+    document.getElementById('total_'  + itemId).textContent = '₹' + item.total.toFixed(2);
+
+    calculateTotals();
+}
+
+function removeItem(itemId) {
+    document.getElementById('item_' + itemId).remove();
+    items = items.filter(i => i.id !== itemId);
+    calculateTotals();
+}
+
+function calculateTotals() {
+    let subtotal = 0, cgst = 0, sgst = 0, igst = 0;
+    items.forEach(i => { subtotal += i.amount; cgst += i.cgst; sgst += i.sgst; igst += i.igst; });
+    const grandTotal = subtotal + cgst + sgst + igst;
+
+    document.getElementById('subtotal_display').textContent    = '₹' + subtotal.toFixed(2);
+    document.getElementById('cgst_display').textContent        = '₹' + cgst.toFixed(2);
+    document.getElementById('sgst_display').textContent        = '₹' + sgst.toFixed(2);
+    document.getElementById('igst_display').textContent        = '₹' + igst.toFixed(2);
+    document.getElementById('grand_total_display').textContent = '₹' + grandTotal.toFixed(2);
+
+    document.getElementById('total_amount').value = subtotal.toFixed(2);
+    document.getElementById('cgst_total').value   = cgst.toFixed(2);
+    document.getElementById('sgst_total').value   = sgst.toFixed(2);
+    document.getElementById('igst_total').value   = igst.toFixed(2);
+    document.getElementById('grand_total').value  = grandTotal.toFixed(2);
+}
+
+document.getElementById('salesForm').onsubmit = function(e) {
+    if (items.length === 0) {
+        alert('Please add at least one item');
+        e.preventDefault();
+        return false;
+    }
+    document.getElementById('items_json').value = JSON.stringify(items);
+};
+
+document.getElementById('globalProductSearch').focus();
+
+// Close suggestions on outside click
+document.addEventListener('click', function(e) {
+    if (!e.target.closest('.product-search-container') && !e.target.closest('.global-search-container')) {
+        document.querySelectorAll('.product-suggestions').forEach(d => d.classList.remove('active'));
+    }
+    if (!e.target.closest('#customer_search') && !e.target.closest('#cust_drop')) {
+        document.getElementById('cust_drop').style.display = 'none';
+    }
+});
+
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') {
+        document.querySelectorAll('.product-suggestions').forEach(d => d.classList.remove('active'));
+        document.getElementById('cust_drop').style.display = 'none';
+        const g = document.getElementById('globalProductSearch');
+        document.getElementById('globalSuggestions').classList.remove('active');
+        g.value = '';
+    }
+});
+</script>
 </body>
 </html>

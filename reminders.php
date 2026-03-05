@@ -294,12 +294,7 @@ $category_icons = ['payment'=>'💰','meeting'=>'🤝','followup'=>'📞','tax'=
     <?php include 'sidebar.php'; ?>
 
     <main class="main-content">
-        <header class="top-bar">
-            <h2 class="page-title">🔔 Reminders</h2>
-            <div class="user-info">
-                <span class="date-time"><?php echo date('l, F j, Y'); ?></span>
-            </div>
-        </header>
+        <?php $page_title = '🔔 Reminders'; include 'topbar.php'; ?>
 
         <div class="content-wrapper">
 
